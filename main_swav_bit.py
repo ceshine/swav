@@ -10,6 +10,7 @@ import os
 import shutil
 import time
 from logging import getLogger
+from typing import Optional
 
 import numpy as np
 import torch
@@ -66,8 +67,8 @@ parser.add_argument("--nmb_prototypes", default=3000, type=int,
                     help="number of prototypes")
 parser.add_argument("--queue_length", type=int, default=0,
                     help="length of the queue (0 for no queue)")
-parser.add_argument("--epoch_queue_starts", type=int, default=15,
-                    help="from this epoch, we start using a queue")
+# parser.add_argument("--epoch_queue_starts", type=int, default=0,
+#                     help="from this epoch, we start using a queue")
 
 #########################
 #### optim parameters ###
@@ -99,7 +100,7 @@ parser.add_argument("--hidden_mlp", default=2048, type=int,
                     help="hidden layer dimension in projection head")
 parser.add_argument("--workers", default=4, type=int,
                     help="number of data loading workers")
-parser.add_argument("--checkpoint_freq", type=int, default=25,
+parser.add_argument("--checkpoint_freq", type=int, default=2000,
                     help="Save the model periodically")
 parser.add_argument("--use_fp16", type=bool_flag, default=True,
                     help="whether to train with mixed precision or not")
@@ -150,16 +151,6 @@ def main():
         output_dim=args.feat_dim,
         nmb_prototypes=args.nmb_prototypes
     )
-    # # synchronize batch norm layers
-    # if args.sync_bn == "pytorch":
-    #     model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
-    # elif args.sync_bn == "apex":
-    #     process_group = None
-    #     if args.world_size // 8 > 0:
-    #         process_group = apex.parallel.create_syncbn_process_group(
-    #             args.world_size // 8)
-    #     model = apex.parallel.convert_syncbn_model(
-    #         model, process_group=process_group)
     # copy model to GPU
     model = model.cuda()
     logger.info(model)
@@ -199,7 +190,8 @@ def main():
         logger.info("Initializing mixed precision done.")
 
     # optionally resume from a checkpoint
-    to_restore = {"epoch": 0}
+    # TODO: set another seed for data loading when restoring
+    to_restore = {"step": 0}
     restart_from_checkpoint(
         os.path.join(args.dump_path, "checkpoint.pth.tar"),
         run_variables=to_restore,
@@ -207,7 +199,7 @@ def main():
         optimizer=optimizer,
         amp=apex.amp,
     )
-    start_epoch = to_restore["epoch"]
+    start_step = to_restore["step"]
 
     # build the queue
     queue = None
@@ -220,50 +212,61 @@ def main():
 
     cudnn.benchmark = True
 
-    for epoch in range(start_epoch, args.epochs):
+    # train the network
+    scores, queue = train(
+        train_loader, model,
+        optimizer, start_step, lr_schedule, queue_path, args
+    )
+    # for epoch in range(start_epoch, args.epochs):
+    # train the network for one epoch
+    # logger.info("============ Starting epoch %i ... ============" % epoch)
 
-        # train the network for one epoch
-        logger.info("============ Starting epoch %i ... ============" % epoch)
+    # # optionally starts a queue
+    # if args.queue_length > 0 and epoch >= args.epoch_queue_starts and queue is None:
+    #     queue = torch.zeros(
+    #         len(args.crops_for_assign),
+    #         args.queue_length,
+    #         args.feat_dim,
+    #     ).cuda()
 
-        # set sampler
-        # train_loader.sampler.set_epoch(epoch)
+    # train the network
+    # scores, queue = train(train_loader, model,
+    #                       optimizer, start_iter, lr_schedule, queue, args)
+    # training_stats.update(scores)
 
-        # optionally starts a queue
-        if args.queue_length > 0 and epoch >= args.epoch_queue_starts and queue is None:
-            queue = torch.zeros(
-                len(args.crops_for_assign),
-                args.queue_length,
-                args.feat_dim,
-            ).cuda()
+    # save checkpoints
+    # save_dict = {
+    #     "epoch": epoch + 1,
+    #     "state_dict": model.state_dict(),
+    #     "optimizer": optimizer.state_dict(),
+    # }
+    # if args.use_fp16:
+    #     save_dict["amp"] = apex.amp.state_dict()
+    # torch.save(
+    #     save_dict,
+    #     os.path.join(args.dump_path, "checkpoint.pth.tar"),
+    # )
+    # if epoch % args.checkpoint_freq == 0 or epoch == args.epochs - 1:
+    #     shutil.copyfile(
+    #         os.path.join(args.dump_path, "checkpoint.pth.tar"),
+    #         os.path.join(args.dump_checkpoints,
+    #                      "ckp-" + str(epoch) + ".pth"),
+    #     )
+    # if queue is not None:
+    #     torch.save({"queue": queue}, queue_path)
 
-        # train the network
-        scores, queue = train(train_loader, model,
-                              optimizer, epoch, lr_schedule, queue)
-        training_stats.update(scores)
 
-        # save checkpoints
-        save_dict = {
-            "epoch": epoch + 1,
-            "state_dict": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-        }
+def train(train_loader, model, optimizer, start_step, lr_schedule, queue_path, args):
+    queue: Optional[torch.Tensor] = None
+    if args.queue_length > 0:
+        queue = torch.zeros(
+            len(args.crops_for_assign),
+            args.queue_length,
+            args.feat_dim,
+        ).cuda()
         if args.use_fp16:
-            save_dict["amp"] = apex.amp.state_dict()
-        torch.save(
-            save_dict,
-            os.path.join(args.dump_path, "checkpoint.pth.tar"),
-        )
-        if epoch % args.checkpoint_freq == 0 or epoch == args.epochs - 1:
-            shutil.copyfile(
-                os.path.join(args.dump_path, "checkpoint.pth.tar"),
-                os.path.join(args.dump_checkpoints,
-                             "ckp-" + str(epoch) + ".pth"),
-            )
-        if queue is not None:
-            torch.save({"queue": queue}, queue_path)
+            queue = queue.half()
 
-
-def train(train_loader, model, optimizer, epoch, lr_schedule, queue):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
@@ -271,91 +274,112 @@ def train(train_loader, model, optimizer, epoch, lr_schedule, queue):
     softmax = nn.Softmax(dim=1).cuda()
     model.train()
     use_the_queue = False
+    step = start_step
 
-    end = time.time()
-    for it, inputs in enumerate(train_loader):
-        # measure data loading time
-        data_time.update(time.time() - end)
-
-        # update learning rate
-        iteration = epoch * len(train_loader) + it
-        for param_group in optimizer.param_groups:
-            param_group["lr"] = lr_schedule[iteration]
-
-        # normalize the prototypes
-        with torch.no_grad():
-            w = model.prototypes.weight.data.clone()
-            w = nn.functional.normalize(w, dim=1, p=2)
-            model.prototypes.weight.copy_(w)
-
-        # ============ multi-res forward passes ... ============
-        embedding, output = model(inputs)
-        embedding = embedding.detach()
-        bs = inputs[0].size(0)
-
-        # ============ swav loss ... ============
-        loss = 0
-        for i, crop_id in enumerate(args.crops_for_assign):
-            with torch.no_grad():
-                out = output[bs * crop_id: bs * (crop_id + 1)]
-
-                # time to use the queue
-                if queue is not None:
-                    if use_the_queue or not torch.all(queue[i, -1, :] == 0):
-                        use_the_queue = True
-                        out = torch.cat((torch.mm(
-                            queue[i],
-                            model.module.prototypes.weight.t()
-                        ), out))
-                    # fill the queue
-                    queue[i, bs:] = queue[i, :-bs].clone()
-                    queue[i, :bs] = embedding[crop_id * bs: (crop_id + 1) * bs]
-                # get assignments
-                q = torch.exp(out / args.epsilon).t()
-                q = sinkhorn(q, args.sinkhorn_iterations)[-bs:]
-
-            # cluster assignment prediction
-            subloss = 0
-            for v in np.delete(np.arange(np.sum(args.nmb_crops)), crop_id):
-                p = softmax(output[bs * v: bs * (v + 1)] / args.temperature)
-                subloss -= torch.mean(torch.sum(q * torch.log(p), dim=1))
-            loss += subloss / (np.sum(args.nmb_crops) - 1)
-        loss /= len(args.crops_for_assign)
-
-        # ============ backward and optim step ... ============
-        optimizer.zero_grad()
-        if args.use_fp16:
-            with apex.amp.scale_loss(loss, optimizer) as scaled_loss:
-                scaled_loss.backward()
-        else:
-            loss.backward()
-        # cancel some gradients
-        if iteration < args.freeze_prototypes_niters:
-            for name, p in model.named_parameters():
-                if "prototypes" in name:
-                    p.grad = None
-        optimizer.step()
-
-        # ============ misc ... ============
-        losses.update(loss.item(), inputs[0].size(0))
-        batch_time.update(time.time() - end)
+    while step < args.epochs * len(train_loader):
         end = time.time()
-        if it % 100 == 1:
-            logger.info(
-                "Epoch: [{0}][{1}]\t"
-                "Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t"
-                "Data {data_time.val:.3f} ({data_time.avg:.3f})\t"
-                "Loss {loss.val:.4f} ({loss.avg:.4f})\t"
-                "Lr: {lr:.8f}".format(
-                    epoch,
-                    it,
-                    batch_time=batch_time,
-                    data_time=data_time,
-                    loss=losses,
-                    lr=optimizer.param_groups[0]["lr"],
+        for inputs in train_loader:
+            # measure data loading time
+            data_time.update(time.time() - end)
+
+            # update learning rate
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = lr_schedule[step]
+
+            # normalize the prototypes
+            with torch.no_grad():
+                w = model.prototypes.weight.data.clone()
+                w = nn.functional.normalize(w, dim=1, p=2)
+                model.prototypes.weight.copy_(w)
+
+            # ============ multi-res forward passes ... ============
+            embedding, output = model(inputs)
+            embedding = embedding.detach()
+            bs = inputs[0].size(0)
+
+            # ============ swav loss ... ============
+            loss = 0
+            for i, crop_id in enumerate(args.crops_for_assign):
+                with torch.no_grad():
+                    out = output[bs * crop_id: bs * (crop_id + 1)]
+
+                    # time to use the queue
+                    if queue is not None:
+                        if use_the_queue or not torch.all(queue[i, -1, :] == 0):
+                            use_the_queue = True
+                            out = torch.cat((torch.mm(
+                                queue[i],
+                                model.prototypes.weight.t()
+                            ).float(), out))
+                        # fill the queue
+                        queue[i, bs:] = queue[i, :-bs].clone()
+                        queue[i, :bs] = embedding[crop_id * bs: (crop_id + 1) * bs]
+                    # get assignments
+                    q = torch.exp(out / args.epsilon).t()
+                    q = sinkhorn(q, args.sinkhorn_iterations)[-bs:]
+
+                # cluster assignment prediction
+                subloss = 0
+                for v in np.delete(np.arange(np.sum(args.nmb_crops)), crop_id):
+                    p = softmax(output[bs * v: bs * (v + 1)] / args.temperature)
+                    subloss -= torch.mean(torch.sum(q * torch.log(p), dim=1))
+                loss += subloss / (np.sum(args.nmb_crops) - 1)
+            loss /= len(args.crops_for_assign)
+
+            # ============ backward and optim step ... ============
+            optimizer.zero_grad()
+            if args.use_fp16:
+                with apex.amp.scale_loss(loss, optimizer) as scaled_loss:
+                    scaled_loss.backward()
+            else:
+                loss.backward()
+            # cancel some gradients
+            if step < args.freeze_prototypes_niters:
+                for name, p in model.named_parameters():
+                    if "prototypes" in name:
+                        p.grad = None
+            optimizer.step()
+
+            # ============ misc ... ============
+            losses.update(loss.item(), inputs[0].size(0))
+            batch_time.update(time.time() - end)
+            end = time.time()
+            if (step + 1) % 100 == 0:
+                logger.info(
+                    "Epoch: [{0}][{1}]\t"
+                    "Time {batch_time.val:.6f} ({batch_time.avg:.6f})\t"
+                    "Data {data_time.val:.6f} ({data_time.avg:.6f})\t"
+                    "Loss {loss.val:.6f} ({loss.avg:.6f})\t"
+                    "Lr: {lr:.8f}".format(
+                        step // len(train_loader),
+                        step % len(train_loader),
+                        batch_time=batch_time,
+                        data_time=data_time,
+                        loss=losses,
+                        lr=optimizer.param_groups[0]["lr"],
+                    )
                 )
-            )
-    return (epoch, losses.avg), queue
+            if (step + 1) % args.checkpoint_freq == 0:
+                save_dict = {
+                    "step": step + 1,
+                    "state_dict": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                }
+                if args.use_fp16:
+                    save_dict["amp"] = apex.amp.state_dict()
+                torch.save(
+                    save_dict,
+                    os.path.join(args.dump_path, "checkpoint.pth.tar"),
+                )
+                shutil.copyfile(
+                    os.path.join(args.dump_path, "checkpoint.pth.tar"),
+                    os.path.join(args.dump_checkpoints,
+                                 "ckp-" + str(step) + ".pth"),
+                )
+                if queue is not None:
+                    torch.save({"queue": queue}, queue_path)
+        step += 1
+    return losses.avg, queue
 
 
 def sinkhorn(Q, nmb_iters):
