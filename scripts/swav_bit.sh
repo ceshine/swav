@@ -25,5 +25,6 @@ python -u main_swav_bit.py \
 --warmup_epochs 1 \
 --start_warmup 0.000001 \
 --arch BiT-M-R50x1 \
+--pretrained_path cache/pretrained/ \
 --use_fp16 true \
 --dump_path $EXPERIMENT_PATH

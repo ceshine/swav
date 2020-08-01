@@ -91,8 +91,10 @@ parser.add_argument("--start_warmup", default=0, type=float,
 #########################
 #### other parameters ###
 #########################
-parser.add_argument("--arch", default="resnet50",
+parser.add_argument("--arch", default="BiT-M-R50x1",
                     type=str, help="convnet architecture")
+parser.add_argument("--pretrained_path", default="",
+                    type=str, help="folder where the pretrained weights are stored")
 parser.add_argument("--hidden_mlp", default=2048, type=int,
                     help="hidden layer dimension in projection head")
 parser.add_argument("--workers", default=4, type=int,
@@ -137,7 +139,9 @@ def main():
 
     # build model
     base_model = BIT_MODELS[args.arch](head_size=-1)
-    base_model.load_from(np.load(f"cache/pretrained/{args.arch}.npz"))
+    if args.pretrained_path:
+        logger.info("Loading pretrained model")
+        base_model.load_from(np.load(f"{args.pretrained_path}/{args.arch}.npz"))
     model = SwAV(
         base_model,
         base_model_dim=base_model.width_factor * 2048,
