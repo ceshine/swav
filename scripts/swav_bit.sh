@@ -5,7 +5,7 @@ mkdir -p $EXPERIMENT_PATH
 
 python -u main_swav_bit.py \
 --data_path $DATASET_PATH \
---nmb_crops 2 2 \
+--nmb_crops 2 6 \
 --size_crops 224 96 \
 --min_scale_crops 0.14 0.05 \
 --max_scale_crops 1. 0.14 \

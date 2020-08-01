@@ -61,6 +61,7 @@ class MultiCropDatasetAlt(Dataset):
             randomresizedcrop = transforms.RandomResizedCrop(
                 size_crops[i],
                 scale=(min_scale_crops[i], max_scale_crops[i]),
+                ratio=(.9, 1.11)
             )
             trans.extend([transforms.Compose([
                 randomresizedcrop,
@@ -109,7 +110,7 @@ class MultiCropDataset(datasets.ImageFolder):
         for i in range(len(size_crops)):
             randomresizedcrop = transforms.RandomResizedCrop(
                 size_crops[i],
-                scale=(min_scale_crops[i], max_scale_crops[i]),
+                scale=(min_scale_crops[i], max_scale_crops[i])
             )
             trans.extend([transforms.Compose([
                 randomresizedcrop,
