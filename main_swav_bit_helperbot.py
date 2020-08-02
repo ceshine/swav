@@ -12,6 +12,7 @@ import time
 from logging import getLogger
 from typing import Optional
 
+import apex
 import numpy as np
 import torch
 import torch.nn as nn
@@ -19,7 +20,11 @@ import torch.nn.parallel
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
 import torch.optim
-import apex
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from pytorch_helper_bot import (
+    MultiStageScheduler, LinearLR
+)
+from pytorch_helper_bot.optimizers import RAdam
 
 from src.utils import (
     bool_flag,
@@ -111,6 +116,10 @@ parser.add_argument("--dump_path", type=str, default=".",
 parser.add_argument("--seed", type=int, default=31, help="seed")
 
 
+def count_parameters(parameters):
+    return int(np.sum(list(p.numel() for p in parameters)))
+
+
 def main():
     global args
     args = parser.parse_args()
@@ -164,23 +173,31 @@ def main():
     #     weight_decay=args.wd,
     # )
     # optimizer = LARC(optimizer=optimizer, trust_coefficient=0.001, clip=False)
-    optimizer = torch.optim.AdamW(
+    optimizer = RAdam(
         model.parameters(),
         lr=args.base_lr,
         weight_decay=args.wd
     )
-    warmup_lr_schedule = np.linspace(
-        args.start_warmup, args.base_lr, int(len(train_loader) * args.warmup_epochs))
-    iters = np.arange(int(len(train_loader) * (args.epochs - args.warmup_epochs)))
-    cosine_lr_schedule = np.array(
-        [
-            args.final_lr +
-            0.5 * (args.base_lr - args.final_lr) *
-            (1 + math.cos(math.pi * t / (len(train_loader) * (args.epochs - args.warmup_epochs))))
-            for t in iters
-        ]
-    )
-    lr_schedule = np.concatenate((warmup_lr_schedule, cosine_lr_schedule))
+    if args.pretrained_path:
+        logger.info("Discriminative learning rate")
+        optimizer = RAdam(
+            [{
+                "params": model.base_model.parameters(),
+                "lr": args.base_lr * 0.1,
+                "weight_decay": 0
+            }, {
+                "params": (
+                    list(model.projection_head.parameters()) +
+                    list(model.prototypes.parameters())
+                ),
+                "lr": args.base_lr,
+                "weight_decay": args.wd
+            }]
+        )
+        group_1 = count_parameters(optimizer.param_groups[0]["params"])
+        group_2 = count_parameters(optimizer.param_groups[1]["params"])
+        logger.info("%d %d %d", group_1, group_2, group_1 + group_2)
+        logger.info(count_parameters(model.parameters()))
     logger.info("Building optimizer done.")
 
     # init mixed precision
@@ -188,6 +205,19 @@ def main():
         model, optimizer = apex.amp.initialize(
             model, optimizer, opt_level="O2")
         logger.info("Initializing mixed precision done.")
+
+    # warmup_lr_schedule = np.linspace(
+    #     args.start_warmup, args.base_lr, int(len(train_loader) * args.warmup_epochs))
+    # iters = np.arange(int(len(train_loader) * (args.epochs - args.warmup_epochs)))
+    # cosine_lr_schedule = np.array(
+    #     [
+    #         args.final_lr +
+    #         0.5 * (args.base_lr - args.final_lr) *
+    #         (1 + math.cos(math.pi * t / (len(train_loader) * (args.epochs - args.warmup_epochs))))
+    #         for t in iters
+    #     ]
+    # )
+    # lr_schedule = np.concatenate((warmup_lr_schedule, cosine_lr_schedule))
 
     # optionally resume from a checkpoint
     # TODO: set another seed for data loading when restoring
@@ -200,6 +230,23 @@ def main():
         amp=apex.amp,
     )
     start_step = to_restore["step"]
+
+    n_steps = args.epochs * len(train_dataset) // args.batch_size
+    warmup_steps = int(args.warmup_epochs * len(train_dataset) / args.batch_size)
+    lr_durations = [
+        warmup_steps,
+        n_steps - warmup_steps + 1
+    ]
+    break_points = [0] + list(np.cumsum(lr_durations))[:-1]
+    lr_scheduler = MultiStageScheduler(
+        [
+            LinearLR(optimizer, 0.01, lr_durations[0]),
+            CosineAnnealingLR(optimizer, lr_durations[1])
+        ],
+        start_at_epochs=break_points
+    )
+    if start_step > 0:
+        lr_scheduler.step(start_step - 1)
 
     # build the queue
     queue = None
@@ -215,7 +262,7 @@ def main():
     # train the network
     scores, queue = train(
         train_loader, model,
-        optimizer, start_step, lr_schedule, queue_path, args
+        optimizer, start_step, lr_scheduler, queue_path, args
     )
     # for epoch in range(start_epoch, args.epochs):
     # train the network for one epoch
@@ -256,7 +303,7 @@ def main():
     #     torch.save({"queue": queue}, queue_path)
 
 
-def train(train_loader, model, optimizer, start_step, lr_schedule, queue_path, args):
+def train(train_loader, model, optimizer, start_step, lr_scheduler, queue_path, args):
     queue: Optional[torch.Tensor] = None
     if args.queue_length > 0:
         queue = torch.zeros(
@@ -281,10 +328,6 @@ def train(train_loader, model, optimizer, start_step, lr_schedule, queue_path, a
         for inputs in train_loader:
             # measure data loading time
             data_time.update(time.time() - end)
-
-            # update learning rate
-            for param_group in optimizer.param_groups:
-                param_group["lr"] = lr_schedule[step]
 
             # normalize the prototypes
             with torch.no_grad():
@@ -356,7 +399,7 @@ def train(train_loader, model, optimizer, start_step, lr_schedule, queue_path, a
                         batch_time=batch_time,
                         data_time=data_time,
                         loss=losses,
-                        lr=optimizer.param_groups[0]["lr"],
+                        lr=optimizer.param_groups[-1]["lr"],
                     )
                 )
             if (step + 1) % args.checkpoint_freq == 0:
@@ -379,6 +422,7 @@ def train(train_loader, model, optimizer, start_step, lr_schedule, queue_path, a
                 if queue is not None:
                     torch.save({"queue": queue}, queue_path)
             step += 1
+            lr_scheduler.step()
     return losses.avg, queue
 
 

@@ -1,9 +1,9 @@
 #!/usr/bin/fish
 set -x DATASET_PATH "/data/pretrain_dataset/"
-set -x EXPERIMENT_PATH "cache/swav/swav_bit50_pretrain"
+set -x EXPERIMENT_PATH "cache/swav/swav_bit50_helperbot"
 mkdir -p $EXPERIMENT_PATH
 
-python -u main_swav_bit.py \
+python -u main_swav_bit_helperbot.py \
 --data_path $DATASET_PATH \
 --nmb_crops 2 6 \
 --size_crops 256 128 \
@@ -19,11 +19,9 @@ python -u main_swav_bit.py \
 --epochs 4 \
 --batch_size 16 \
 --base_lr 0.0003 \
---final_lr 0.000001 \
 --freeze_prototypes_niters 500 \
---wd 0.000001 \
+--wd 0 \
 --warmup_epochs .5 \
---start_warmup 0.000001 \
 --arch BiT-M-R50x1 \
 --pretrained_path cache/pretrained/ \
 --use_fp16 true \
