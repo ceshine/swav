@@ -91,8 +91,9 @@ parser.add_argument("--freeze_prototypes_niters", default=313, type=int,
 parser.add_argument("--wd", default=1e-6, type=float, help="weight decay")
 parser.add_argument("--warmup_epochs", default=.5,
                     type=float, help="number of warmup epochs")
-parser.add_argument("--start_warmup", default=0, type=float,
-                    help="initial warmup learning rate")
+parser.add_argument("--grad_accu", default=1, type=int,
+                    help="gradient accumulation steps")
+
 
 #########################
 #### other parameters ###
@@ -183,7 +184,7 @@ def main():
         optimizer = RAdam(
             [{
                 "params": model.base_model.parameters(),
-                "lr": args.base_lr * 0.1,
+                "lr": args.base_lr * 0.25,
                 "weight_decay": 0
             }, {
                 "params": (
@@ -228,6 +229,7 @@ def main():
         state_dict=model,
         optimizer=optimizer,
         amp=apex.amp,
+        distributed=False
     )
     start_step = to_restore["step"]
 
@@ -238,6 +240,8 @@ def main():
         n_steps - warmup_steps + 1
     ]
     break_points = [0] + list(np.cumsum(lr_durations))[:-1]
+    print(lr_durations)
+    print(break_points)
     lr_scheduler = MultiStageScheduler(
         [
             LinearLR(optimizer, 0.01, lr_durations[0]),
@@ -367,21 +371,24 @@ def train(train_loader, model, optimizer, start_step, lr_scheduler, queue_path, 
                     p = softmax(output[bs * v: bs * (v + 1)] / args.temperature)
                     subloss -= torch.mean(torch.sum(q * torch.log(p), dim=1))
                 loss += subloss / (np.sum(args.nmb_crops) - 1)
-            loss /= len(args.crops_for_assign)
+            loss /= len(args.crops_for_assign) * args.grad_accu
 
             # ============ backward and optim step ... ============
-            optimizer.zero_grad()
             if args.use_fp16:
-                with apex.amp.scale_loss(loss, optimizer) as scaled_loss:
+                with apex.amp.scale_loss(
+                    loss, optimizer, delay_unscale=(step % args.grad_accu != 0)
+                ) as scaled_loss:
                     scaled_loss.backward()
             else:
                 loss.backward()
-            # cancel some gradients
-            if step < args.freeze_prototypes_niters:
-                for name, p in model.named_parameters():
-                    if "prototypes" in name:
-                        p.grad = None
-            optimizer.step()
+            if step % args.grad_accu == 0:
+                # cancel some gradients
+                if step < args.freeze_prototypes_niters:
+                    for name, p in model.named_parameters():
+                        if "prototypes" in name:
+                            p.grad = None
+                optimizer.step()
+                optimizer.zero_grad()
 
             # ============ misc ... ============
             losses.update(loss.item(), inputs[0].size(0))

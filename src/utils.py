@@ -107,7 +107,7 @@ def initialize_exp(params, *args, dump_params=True):
     return logger, training_stats
 
 
-def restart_from_checkpoint(ckp_paths, run_variables=None, **kwargs):
+def restart_from_checkpoint(ckp_paths, run_variables=None, distributed: bool = True, **kwargs):
     """
     Re-start from checkpoint
     """
@@ -125,10 +125,12 @@ def restart_from_checkpoint(ckp_paths, run_variables=None, **kwargs):
     logger.info("Found checkpoint at {}".format(ckp_path))
 
     # open checkpoint file
-    checkpoint = torch.load(
-        ckp_path, map_location="cuda:" + str(torch.distributed.get_rank() % torch.cuda.device_count())
-    )
-
+    if distributed:
+        checkpoint = torch.load(
+            ckp_path, map_location="cuda:" + str(torch.distributed.get_rank() % torch.cuda.device_count())
+        )
+    else:
+        checkpoint = torch.load(ckp_path, map_location="cuda")
     # key is what to look for in the checkpoint file
     # value is the object to load
     # example: {'state_dict': model}
